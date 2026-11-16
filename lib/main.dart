@@ -3,6 +3,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
+import 'package:speech_to_text_platform_interface/speech_to_text_platform_interface.dart';
+import 'dart:async';
 import 'phrase_registration_screen.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -175,6 +177,11 @@ class _PointingConversationScreenState
   bool _receivedSpeechResult = false;
   // 別の言語指定で再試行する準備中（直前のセッションの done を無視する）
   bool _speechRetryPending = false;
+  // 認識エンジンが前のセッションをまだ終えていない（done 待ち）
+  bool _speechEngineBusy = false;
+  Completer<void>? _speechEngineIdle;
+  // Web で一度でも listen したか（2回目以降は認識エンジンを作り直す）
+  bool _webRecognizerUsed = false;
   bool _isOpponentMode = false;
   String _recognizedText = '';
 
@@ -331,10 +338,53 @@ class _PointingConversationScreenState
     _speech.statusListener = _onSpeechStatus;
     _speech.errorListener = _onSpeechError;
 
+    await _prepareSpeechEngine();
+
     _localeCandidates = await _speechLocaleCandidates();
     _localeAttempt = 0;
     _addSpeechLog('言語指定の候補: $_localeCandidates');
     await _startListeningAttempt();
+  }
+
+  // 前のセッションが終わるのを待ち、Web では認識エンジンを作り直す。
+  // iOS Safari では同じ SpeechRecognition を使い回すと、2回目以降に
+  // listening にはなるが結果が届かないことがあるため。
+  Future<void> _prepareSpeechEngine() async {
+    if (_speechEngineBusy) {
+      _addSpeechLog('前のセッションの終了待ち…');
+      _speechEngineIdle ??= Completer<void>();
+      try {
+        await _speechEngineIdle!.future.timeout(const Duration(seconds: 3));
+        _addSpeechLog('前のセッションが終了しました');
+      } on TimeoutException {
+        _addSpeechLog('終了待ちがタイムアウト。cancel() で中断します');
+        try {
+          await _speech.cancel();
+        } catch (e) {
+          _addSpeechLog('cancel() 例外: $e');
+        }
+        await Future.delayed(const Duration(milliseconds: 300));
+        _markSpeechEngineIdle();
+      }
+    }
+
+    if (kIsWeb && _webRecognizerUsed) {
+      try {
+        final ok = await SpeechToTextPlatform.instance.initialize();
+        _addSpeechLog('認識エンジンを作り直しました: $ok');
+      } catch (e) {
+        _addSpeechLog('認識エンジンの作り直しで例外: $e');
+      }
+    }
+  }
+
+  void _markSpeechEngineIdle() {
+    _speechEngineBusy = false;
+    final idle = _speechEngineIdle;
+    _speechEngineIdle = null;
+    if (idle != null && !idle.isCompleted) {
+      idle.complete();
+    }
   }
 
   // 試す言語指定の候補を返す。
@@ -363,6 +413,8 @@ class _PointingConversationScreenState
     final sessionId = ++_speechSessionId;
     _speechRetryPending = false;
     _receivedSpeechResult = false;
+    _speechEngineBusy = true;
+    if (kIsWeb) _webRecognizerUsed = true;
     _addSpeechLog('listen() 開始 #$sessionId (localeId="$localeId", '
         '${_localeAttempt + 1}/${_localeCandidates.length})');
 
@@ -398,6 +450,7 @@ class _PointingConversationScreenState
       _addSpeechLog('listen() 呼び出し完了 #$sessionId');
     } catch (e) {
       _addSpeechLog('listen() 例外: $e');
+      _markSpeechEngineIdle();
       _finishListening('listen() 例外');
       _showSpeechMessage('音声入力を開始できませんでした（$e）');
     }
@@ -405,6 +458,9 @@ class _PointingConversationScreenState
 
   void _onSpeechStatus(String status) {
     _addSpeechLog('onStatus: $status');
+    if (status == stt.SpeechToText.doneStatus) {
+      _markSpeechEngineIdle();
+    }
     if (_speechRetryPending) return;
     // ブラウザや OS が認識を自動で終えた場合も、画面を元に戻す
     if (status == stt.SpeechToText.doneStatus ||
