@@ -3,9 +3,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
-import 'package:speech_to_text_platform_interface/speech_to_text_platform_interface.dart';
 import 'dart:async';
 import 'phrase_registration_screen.dart';
+import 'web_speech/web_speech.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -180,8 +180,11 @@ class _PointingConversationScreenState
   // 認識エンジンが前のセッションをまだ終えていない（done 待ち）
   bool _speechEngineBusy = false;
   Completer<void>? _speechEngineIdle;
-  // Web で一度でも listen したか（2回目以降は認識エンジンを作り直す）
-  bool _webRecognizerUsed = false;
+  // Web ではブラウザの音声認識を直接使う（speech_to_text は使わない）
+  final WebSpeechRecognizer _webSpeech = WebSpeechRecognizer();
+  Completer<void>? _webSpeechEnded;
+  Timer? _webAudioWatchdog;
+  bool _webAudioStarted = false;
   bool _isOpponentMode = false;
   String _recognizedText = '';
 
@@ -201,11 +204,16 @@ class _PointingConversationScreenState
 
   @override
   void dispose() {
-    // 共有インスタンスなので、この画面のコールバックを外してから止める
-    _speech.statusListener = null;
-    _speech.errorListener = null;
-    if (_isListening) {
-      _speech.cancel();
+    _webAudioWatchdog?.cancel();
+    if (kIsWeb) {
+      _webSpeech.abort();
+    } else {
+      // 共有インスタンスなので、この画面のコールバックを外してから止める
+      _speech.statusListener = null;
+      _speech.errorListener = null;
+      if (_isListening) {
+        _speech.cancel();
+      }
     }
     _textController.dispose();
     super.dispose();
@@ -305,17 +313,27 @@ class _PointingConversationScreenState
   Future<void> _listenSpeech() async {
     if (_isListening) {
       _addSpeechLog('停止ボタン押下 (recognizedText="$_recognizedText")');
-      try {
-        await _speech.stop();
-        _addSpeechLog('stop() 完了');
-      } catch (e) {
-        _addSpeechLog('stop() 例外: $e');
+      if (kIsWeb) {
+        _webSpeech.stop();
+        _addSpeechLog('stop() 呼び出し');
+      } else {
+        try {
+          await _speech.stop();
+          _addSpeechLog('stop() 完了');
+        } catch (e) {
+          _addSpeechLog('stop() 例外: $e');
+        }
       }
       _finishListening('停止ボタン');
       return;
     }
 
     _addSpeechLog('---- マイクボタン押下：開始 ----');
+
+    if (kIsWeb) {
+      await _startWebListening();
+      return;
+    }
 
     if (!_speechAvailable) {
       try {
@@ -346,9 +364,96 @@ class _PointingConversationScreenState
     await _startListeningAttempt();
   }
 
-  // 前のセッションが終わるのを待ち、Web では認識エンジンを作り直す。
-  // iOS Safari では同じ SpeechRecognition を使い回すと、2回目以降に
-  // listening にはなるが結果が届かないことがあるため。
+  // Web：ブラウザの音声認識を直接使って1回分の認識を始める。
+  // iOS Safari では speech_to_text 経由（continuous=true・使い回し）だと
+  // 2回目以降に結果が届かないため、毎回新しく作り continuous=false で使う。
+  Future<void> _startWebListening() async {
+    if (!WebSpeechRecognizer.isSupported) {
+      _addSpeechLog('このブラウザは SpeechRecognition に対応していません');
+      _showSpeechMessage('この環境では音声入力が使えません。'
+          'iPhone では Safari で開いてください。'
+          'キーボードのマイクボタンからの音声入力も使えます。');
+      return;
+    }
+
+    if (_webSpeech.isActive) {
+      _addSpeechLog('前のセッションの終了待ち…');
+      final ended = _webSpeechEnded ??= Completer<void>();
+      try {
+        await ended.future.timeout(const Duration(seconds: 2));
+        _addSpeechLog('前のセッションが終了しました');
+      } on TimeoutException {
+        _addSpeechLog('終了待ちがタイムアウト。abort() します');
+        _webSpeech.abort();
+      }
+    }
+
+    final sessionId = ++_speechSessionId;
+    _receivedSpeechResult = false;
+    _webAudioStarted = false;
+
+    _webSpeech
+      ..onEvent = (name) {
+        _addSpeechLog('event #$sessionId: $name');
+        if (name == 'audiostart') _webAudioStarted = true;
+      }
+      ..onResult = (text, isFinal) {
+        _addSpeechLog('onResult #$sessionId: "$text" (final=$isFinal)');
+        if (sessionId != _speechSessionId || !_isListening) return;
+        if (text.isEmpty) return;
+        _receivedSpeechResult = true;
+        setState(() {
+          _recognizedText = text;
+          _textController.value = TextEditingValue(
+            text: text,
+            selection: TextSelection.collapsed(offset: text.length),
+          );
+        });
+      }
+      ..onError = (code, message) {
+        _addSpeechLog('onError #$sessionId: $code ${message.isEmpty ? '' : '($message)'}');
+        if (sessionId != _speechSessionId) return;
+        _finishListening('onError: $code');
+        final text = _speechErrorMessage(code);
+        if (text != null) _showSpeechMessage(text);
+      }
+      ..onEnd = () {
+        _addSpeechLog('event #$sessionId: end');
+        final ended = _webSpeechEnded;
+        _webSpeechEnded = null;
+        if (ended != null && !ended.isCompleted) ended.complete();
+        if (sessionId == _speechSessionId) {
+          _finishListening('end');
+        }
+      };
+
+    setState(() {
+      _isListening = true;
+      _recognizedText = '';
+    });
+
+    final ok = _webSpeech.start(
+      lang: 'ja-JP',
+      continuous: false,
+      interimResults: true,
+    );
+    _addSpeechLog('start() #$sessionId: $ok (lang=ja-JP, continuous=false)');
+    if (!ok) {
+      _finishListening('start() 失敗');
+      return;
+    }
+
+    // マイクの音が届いているか（audiostart が来るか）を確認する
+    _webAudioWatchdog?.cancel();
+    _webAudioWatchdog = Timer(const Duration(seconds: 4), () {
+      if (sessionId == _speechSessionId && _isListening && !_webAudioStarted) {
+        _addSpeechLog('警告 #$sessionId: 4秒たっても audiostart が来ていません'
+            '（マイクの音が認識に届いていない可能性）');
+      }
+    });
+  }
+
+  // ネイティブ：前のセッションが終わるのを待つ
   Future<void> _prepareSpeechEngine() async {
     if (_speechEngineBusy) {
       _addSpeechLog('前のセッションの終了待ち…');
@@ -367,15 +472,6 @@ class _PointingConversationScreenState
         _markSpeechEngineIdle();
       }
     }
-
-    if (kIsWeb && _webRecognizerUsed) {
-      try {
-        final ok = await SpeechToTextPlatform.instance.initialize();
-        _addSpeechLog('認識エンジンを作り直しました: $ok');
-      } catch (e) {
-        _addSpeechLog('認識エンジンの作り直しで例外: $e');
-      }
-    }
   }
 
   void _markSpeechEngineIdle() {
@@ -387,13 +483,8 @@ class _PointingConversationScreenState
     }
   }
 
-  // 試す言語指定の候補を返す。
-  // Web は BCP 47 形式（ja-JP）が正しい形式。それで断られた場合に備えて、
-  // 旧形式と「ブラウザの既定（空文字）」も候補に入れる。
+  // ネイティブ：端末の言語一覧から日本語を探す
   Future<List<String>> _speechLocaleCandidates() async {
-    if (kIsWeb) {
-      return const ['ja-JP', 'ja_JP', ''];
-    }
     try {
       final locales = await _speech.locales();
       _addSpeechLog('locales(): ${locales.map((l) => l.localeId).toList()}');
@@ -414,7 +505,6 @@ class _PointingConversationScreenState
     _speechRetryPending = false;
     _receivedSpeechResult = false;
     _speechEngineBusy = true;
-    if (kIsWeb) _webRecognizerUsed = true;
     _addSpeechLog('listen() 開始 #$sessionId (localeId="$localeId", '
         '${_localeAttempt + 1}/${_localeCandidates.length})');
 
@@ -538,6 +628,7 @@ class _PointingConversationScreenState
   // 認識セッションを終了し、認識した文字をチャットに追加する（何度呼んでもよい）
   void _finishListening(String reason) {
     _speechRetryPending = false;
+    _webAudioWatchdog?.cancel();
     if (!_isListening) return;
     _addSpeechLog('終了処理 ($reason)');
     final text = _recognizedText.trim();
