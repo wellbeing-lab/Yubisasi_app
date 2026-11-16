@@ -1,4 +1,6 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'phrase_registration_screen.dart';
 import 'dart:convert';
@@ -165,6 +167,10 @@ class _PointingConversationScreenState
   bool _isOpponentMode = false;
   String _recognizedText = '';
 
+  // 音声認識の調査用ログ（画面に表示し、コピーできるようにする）
+  final List<String> _speechLogs = [];
+  static const int _maxSpeechLogs = 100;
+
   Map<String, List<String>> _customPhrasesMap = {};
   String _selectedSubCategory = '目的';
   String _selectedMainTab = '身体情報';
@@ -192,13 +198,88 @@ class _PointingConversationScreenState
     });
   }
 
+  // 音声認識のログを1行追加する（画面表示とコンソール出力）
+  void _addSpeechLog(String message) {
+    final now = DateTime.now();
+    String two(int v) => v.toString().padLeft(2, '0');
+    final line =
+        '${two(now.hour)}:${two(now.minute)}:${two(now.second)}.${now.millisecond.toString().padLeft(3, '0')} $message';
+    debugPrint('[speech] $line');
+    if (!mounted) return;
+    setState(() {
+      _speechLogs.add(line);
+      if (_speechLogs.length > _maxSpeechLogs) {
+        _speechLogs.removeAt(0);
+      }
+    });
+  }
+
+  String _speechLogText() {
+    final header = [
+      '指さし会話 音声ログ',
+      'platform: ${kIsWeb ? 'web' : 'native'} / ${defaultTargetPlatform.name}',
+      'exported: ${DateTime.now().toIso8601String()}',
+      '',
+    ];
+    return [...header, ..._speechLogs].join('\n');
+  }
+
+  Future<void> _copySpeechLogs() async {
+    await Clipboard.setData(ClipboardData(text: _speechLogText()));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('音声ログをコピーしました')),
+    );
+  }
+
+  void _showSpeechLogDialog() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('音声ログ'),
+        content: SizedBox(
+          width: double.maxFinite,
+          height: 400,
+          child: _speechLogs.isEmpty
+              ? const Center(child: Text('ログはまだありません'))
+              : SingleChildScrollView(
+                  reverse: true,
+                  child: SelectableText(
+                    _speechLogText(),
+                    style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                  ),
+                ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              setState(() => _speechLogs.clear());
+              Navigator.of(context).pop();
+            },
+            child: const Text('消去'),
+          ),
+          TextButton(
+            onPressed: _copySpeechLogs,
+            child: const Text('コピー'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('閉じる'),
+          ),
+        ],
+      ),
+    );
+  }
+
   // 音声認識処理（独立した正しい位置）
   void _listenSpeech() async {
     if (_isListening) {
+      _addSpeechLog('停止ボタン押下 (recognizedText="$_recognizedText")');
       try {
         await _speech.stop();
+        _addSpeechLog('stop() 完了');
       } catch (e) {
-        print("停止エラー: $e");
+        _addSpeechLog('stop() 例外: $e');
       }
       
       setState(() {
@@ -213,20 +294,30 @@ class _PointingConversationScreenState
       return;
     }
 
+    _addSpeechLog('---- マイクボタン押下：開始 ----');
     _speech = stt.SpeechToText();
 
-    bool available = await _speech.initialize(
-      onStatus: (status) => print('onStatus: $status'),
-      onError: (error) => print('onError: $error'),
-    );
+    bool available = false;
+    try {
+      available = await _speech.initialize(
+        onStatus: (status) => _addSpeechLog('onStatus: $status'),
+        onError: (error) => _addSpeechLog(
+            'onError: ${error.errorMsg} (permanent=${error.permanent})'),
+      );
+    } catch (e) {
+      _addSpeechLog('initialize() 例外: $e');
+    }
+    _addSpeechLog('initialize() 結果: available=$available');
     
     if (!available) {
-      print("音声認識が利用できません");
+      _addSpeechLog('音声認識が利用できません');
       return;
     }
 
     // ★追加：端末のブラウザ環境から利用可能なロケール一覧を取得し、日本語を探す
     var locales = await _speech.locales();
+    _addSpeechLog(
+        'locales(): ${locales.map((l) => l.localeId).toList()}');
     String targetLocaleId = 'ja_JP'; // デフォルト
     for (var locale in locales) {
       // 'ja_JP' または 'ja-JP' などの日本語ロケールを優先的に選択
@@ -235,28 +326,36 @@ class _PointingConversationScreenState
         break;
       }
     }
+    _addSpeechLog('使用するlocaleId: $targetLocaleId');
 
     setState(() {
       _isListening = true;
       _recognizedText = '';
     });
 
-    _speech.listen(
-      onResult: (val) {
-        if (val.recognizedWords.isNotEmpty) {
-          setState(() {
-            _recognizedText = val.recognizedWords;
-            // 認識されたらテキストコントローラーやチャットに即時反映
-            _textController.text = _recognizedText;
-          });
-        }
-      },
-      listenOptions: stt.SpeechListenOptions(
-        // ★固定の 'ja_JP' ではなく、検出した正確なロケールIDを渡す
-        localeId: targetLocaleId,
-        partialResults: true,
-      ),
-    );
+    try {
+      await _speech.listen(
+        onResult: (val) {
+          _addSpeechLog(
+              'onResult: "${val.recognizedWords}" (final=${val.finalResult}, alternates=${val.alternates.length})');
+          if (val.recognizedWords.isNotEmpty) {
+            setState(() {
+              _recognizedText = val.recognizedWords;
+              // 認識されたらテキストコントローラーやチャットに即時反映
+              _textController.text = _recognizedText;
+            });
+          }
+        },
+        listenOptions: stt.SpeechListenOptions(
+          // ★固定の 'ja_JP' ではなく、検出した正確なロケールIDを渡す
+          localeId: targetLocaleId,
+          partialResults: true,
+        ),
+      );
+      _addSpeechLog('listen() 呼び出し完了');
+    } catch (e) {
+      _addSpeechLog('listen() 例外: $e');
+    }
   }
 
   // SharedPreferencesからカスタム語句を読み込む
@@ -1075,6 +1174,11 @@ class _PointingConversationScreenState
           ),
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.bug_report_outlined),
+            tooltip: '音声ログ',
+            onPressed: _showSpeechLogDialog,
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 8.0),
             child: TextButton.icon(
@@ -1416,6 +1520,36 @@ class _PointingConversationScreenState
                               fontWeight: FontWeight.bold,
                             ),
                           ),
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      Container(
+                        width: 320,
+                        height: 200,
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.5),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: ListView.builder(
+                          reverse: true,
+                          itemCount: _speechLogs.length,
+                          itemBuilder: (context, index) => Text(
+                            _speechLogs[_speechLogs.length - 1 - index],
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontFamily: 'monospace',
+                              fontSize: 11,
+                            ),
+                          ),
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: _copySpeechLogs,
+                        icon: const Icon(Icons.copy, color: Colors.white70, size: 18),
+                        label: const Text(
+                          'ログをコピー',
+                          style: TextStyle(color: Colors.white70),
                         ),
                       ),
                     ],
