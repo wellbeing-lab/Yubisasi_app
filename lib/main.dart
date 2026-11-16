@@ -9,6 +9,10 @@ import 'phrase_registration_screen.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
+// ビルド時に CI から渡される版（git のコミット）。手元のビルドでは 'dev'
+const String _appVersion =
+    String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
+
 void main() {
   runApp(const MyApp());
 }
@@ -247,6 +251,7 @@ class _PointingConversationScreenState
   String _speechLogText() {
     final header = [
       '指さし会話 音声ログ',
+      'version: $_appVersion',
       'platform: ${kIsWeb ? 'web' : 'native'} / ${defaultTargetPlatform.name}',
       'exported: ${DateTime.now().toIso8601String()}',
       '',
@@ -315,7 +320,7 @@ class _PointingConversationScreenState
       return;
     }
 
-    _addSpeechLog('---- マイクボタン押下：開始 ----');
+    _addSpeechLog('---- マイクボタン押下：開始 (version $_appVersion) ----');
 
     if (!_speechAvailable) {
       try {
