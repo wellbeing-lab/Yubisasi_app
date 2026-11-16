@@ -2,6 +2,13 @@
 class WebSpeechRecognizer {
   static bool get isSupported => false;
 
+  Future<String> openMic() async =>
+      throw UnsupportedError('Web 以外では使いません');
+
+  String micInfo() => '';
+
+  void closeMic() {}
+
   void Function(String event)? onEvent;
   void Function(String transcript, bool isFinal)? onResult;
   void Function(String error, String message)? onError;
