@@ -3,6 +3,8 @@ name: Deploy Web to GitHub Pages
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +13,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: pages
+  group: pages-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -33,10 +35,13 @@ jobs:
         run: flutter build web --release --base-href "/${{ github.event.repository.name }}/"
 
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: build/web
 
   deploy:
+    # PR ではビルドの確認だけ行い、公開は main への push 時のみ
+    if: github.event_name != 'pull_request'
     needs: build
     runs-on: ubuntu-latest
     environment:
