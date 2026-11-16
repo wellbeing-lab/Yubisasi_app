@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  // Azure Speech の一時トークンを発行するだけの Worker。
+  // Azure のキーは secret（AZURE_SPEECH_KEY）として登録し、リポジトリには置かない:
+  //   npx wrangler secret put AZURE_SPEECH_KEY
+  "name": "yubisasi-speech-token",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  "vars": {
+    // Azure Speech リソースのリージョン
+    "AZURE_SPEECH_REGION": "japaneast",
+    // トークンを渡してよいページの Origin（カンマ区切り）
+    "ALLOWED_ORIGINS": "https://wellbeing-lab.github.io,http://localhost:8080"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
