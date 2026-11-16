@@ -1,6 +1,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'phrase_registration_screen.dart';
 import 'dart:convert';
@@ -162,8 +163,18 @@ class _PointingConversationScreenState
   final List<ChatMessage> _messages = [];
   final TextEditingController _textController = TextEditingController();
 
-  late stt.SpeechToText _speech;
+  // speech_to_text はアプリ全体で1つのインスタンスを共有する（initialize も初回のみ有効）
+  final stt.SpeechToText _speech = stt.SpeechToText();
+  bool _speechAvailable = false;
   bool _isListening = false;
+  // 試す言語指定の候補と、今何番目を試しているか
+  List<String> _localeCandidates = const [];
+  int _localeAttempt = 0;
+  // 認識セッションの番号（古いセッションのコールバックを無視するため）
+  int _speechSessionId = 0;
+  bool _receivedSpeechResult = false;
+  // 別の言語指定で再試行する準備中（直前のセッションの done を無視する）
+  bool _speechRetryPending = false;
   bool _isOpponentMode = false;
   String _recognizedText = '';
 
@@ -179,6 +190,18 @@ class _PointingConversationScreenState
   void initState() {
     super.initState();
     _loadCustomPhrasesForChat();
+  }
+
+  @override
+  void dispose() {
+    // 共有インスタンスなので、この画面のコールバックを外してから止める
+    _speech.statusListener = null;
+    _speech.errorListener = null;
+    if (_isListening) {
+      _speech.cancel();
+    }
+    _textController.dispose();
+    super.dispose();
   }
 
   // メッセージ送信処理
@@ -271,8 +294,8 @@ class _PointingConversationScreenState
     );
   }
 
-  // 音声認識処理（独立した正しい位置）
-  void _listenSpeech() async {
+  // マイクボタン：認識中なら停止、そうでなければ開始
+  Future<void> _listenSpeech() async {
     if (_isListening) {
       _addSpeechLog('停止ボタン押下 (recognizedText="$_recognizedText")');
       try {
@@ -281,52 +304,67 @@ class _PointingConversationScreenState
       } catch (e) {
         _addSpeechLog('stop() 例外: $e');
       }
-      
-      setState(() {
-        _isListening = false;
-        if (_recognizedText.trim().isNotEmpty) {
-          _messages.add(
-            ChatMessage(text: _recognizedText, isPartner: true),
-          );
-          _recognizedText = '';
-        }
-      });
+      _finishListening('停止ボタン');
       return;
     }
 
     _addSpeechLog('---- マイクボタン押下：開始 ----');
-    _speech = stt.SpeechToText();
 
-    bool available = false;
-    try {
-      available = await _speech.initialize(
-        onStatus: (status) => _addSpeechLog('onStatus: $status'),
-        onError: (error) => _addSpeechLog(
-            'onError: ${error.errorMsg} (permanent=${error.permanent})'),
-      );
-    } catch (e) {
-      _addSpeechLog('initialize() 例外: $e');
+    if (!_speechAvailable) {
+      try {
+        _speechAvailable = await _speech.initialize(
+          onStatus: _onSpeechStatus,
+          onError: _onSpeechError,
+        );
+      } catch (e) {
+        _addSpeechLog('initialize() 例外: $e');
+      }
+      _addSpeechLog('initialize() 結果: available=$_speechAvailable');
     }
-    _addSpeechLog('initialize() 結果: available=$available');
-    
-    if (!available) {
-      _addSpeechLog('音声認識が利用できません');
+    if (!_speechAvailable) {
+      _showSpeechMessage('この環境では音声入力が使えません。'
+          'iPhone では Safari で開いてください。'
+          'キーボードのマイクボタンからの音声入力も使えます。');
       return;
     }
+    // 共有インスタンスなので、毎回この画面のコールバックを付け直す
+    _speech.statusListener = _onSpeechStatus;
+    _speech.errorListener = _onSpeechError;
 
-    // ★追加：端末のブラウザ環境から利用可能なロケール一覧を取得し、日本語を探す
-    var locales = await _speech.locales();
-    _addSpeechLog(
-        'locales(): ${locales.map((l) => l.localeId).toList()}');
-    String targetLocaleId = 'ja_JP'; // デフォルト
-    for (var locale in locales) {
-      // 'ja_JP' または 'ja-JP' などの日本語ロケールを優先的に選択
-      if (locale.localeId.toLowerCase().contains('ja')) {
-        targetLocaleId = locale.localeId;
-        break;
-      }
+    _localeCandidates = await _speechLocaleCandidates();
+    _localeAttempt = 0;
+    _addSpeechLog('言語指定の候補: $_localeCandidates');
+    await _startListeningAttempt();
+  }
+
+  // 試す言語指定の候補を返す。
+  // Web は BCP 47 形式（ja-JP）が正しい形式。それで断られた場合に備えて、
+  // 旧形式と「ブラウザの既定（空文字）」も候補に入れる。
+  Future<List<String>> _speechLocaleCandidates() async {
+    if (kIsWeb) {
+      return const ['ja-JP', 'ja_JP', ''];
     }
-    _addSpeechLog('使用するlocaleId: $targetLocaleId');
+    try {
+      final locales = await _speech.locales();
+      _addSpeechLog('locales(): ${locales.map((l) => l.localeId).toList()}');
+      for (final locale in locales) {
+        if (locale.localeId.toLowerCase().startsWith('ja')) {
+          return [locale.localeId];
+        }
+      }
+    } catch (e) {
+      _addSpeechLog('locales() 例外: $e');
+    }
+    return const ['ja_JP'];
+  }
+
+  Future<void> _startListeningAttempt() async {
+    final localeId = _localeCandidates[_localeAttempt];
+    final sessionId = ++_speechSessionId;
+    _speechRetryPending = false;
+    _receivedSpeechResult = false;
+    _addSpeechLog('listen() 開始 #$sessionId (localeId="$localeId", '
+        '${_localeAttempt + 1}/${_localeCandidates.length})');
 
     setState(() {
       _isListening = true;
@@ -337,25 +375,125 @@ class _PointingConversationScreenState
       await _speech.listen(
         onResult: (val) {
           _addSpeechLog(
-              'onResult: "${val.recognizedWords}" (final=${val.finalResult}, alternates=${val.alternates.length})');
-          if (val.recognizedWords.isNotEmpty) {
-            setState(() {
-              _recognizedText = val.recognizedWords;
-              // 認識されたらテキストコントローラーやチャットに即時反映
-              _textController.text = _recognizedText;
-            });
-          }
+              'onResult #$sessionId: "${val.recognizedWords}" (final=${val.finalResult})');
+          // 終了済み・古いセッションの結果は無視する
+          if (sessionId != _speechSessionId || !_isListening) return;
+          if (val.recognizedWords.isEmpty) return;
+          _receivedSpeechResult = true;
+          setState(() {
+            _recognizedText = val.recognizedWords;
+            // 認識途中の文字を入力欄に表示する
+            _textController.value = TextEditingValue(
+              text: _recognizedText,
+              selection:
+                  TextSelection.collapsed(offset: _recognizedText.length),
+            );
+          });
         },
         listenOptions: stt.SpeechListenOptions(
-          // ★固定の 'ja_JP' ではなく、検出した正確なロケールIDを渡す
-          localeId: targetLocaleId,
+          localeId: localeId,
           partialResults: true,
         ),
       );
-      _addSpeechLog('listen() 呼び出し完了');
+      _addSpeechLog('listen() 呼び出し完了 #$sessionId');
     } catch (e) {
       _addSpeechLog('listen() 例外: $e');
+      _finishListening('listen() 例外');
+      _showSpeechMessage('音声入力を開始できませんでした（$e）');
     }
+  }
+
+  void _onSpeechStatus(String status) {
+    _addSpeechLog('onStatus: $status');
+    if (_speechRetryPending) return;
+    // ブラウザや OS が認識を自動で終えた場合も、画面を元に戻す
+    if (status == stt.SpeechToText.doneStatus ||
+        status == stt.SpeechToText.notListeningStatus) {
+      _finishListening('onStatus: $status');
+    }
+  }
+
+  void _onSpeechError(SpeechRecognitionError error) {
+    _addSpeechLog(
+        'onError: ${error.errorMsg} (permanent=${error.permanent})');
+    if (!_isListening || _speechRetryPending) return;
+
+    final code = error.errorMsg;
+    final canRetry = (code == 'service-not-allowed' ||
+            code == 'language-not-supported') &&
+        !_receivedSpeechResult &&
+        _localeAttempt + 1 < _localeCandidates.length;
+    if (canRetry) {
+      // 言語指定が原因で断られた可能性があるので、次の候補で試す
+      _speechRetryPending = true;
+      _localeAttempt++;
+      _addSpeechLog('別の言語指定で再試行します');
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (!mounted || !_speechRetryPending) return;
+        _startListeningAttempt();
+      });
+      return;
+    }
+
+    _finishListening('onError: $code');
+    final message = _speechErrorMessage(code);
+    if (message != null) {
+      _showSpeechMessage(message);
+    }
+  }
+
+  // エラーコードを利用者向けの説明に変換する（null なら表示しない）
+  String? _speechErrorMessage(String code) {
+    switch (code) {
+      case 'service-not-allowed':
+        return 'この端末では音声認識サービスが使えませんでした（service-not-allowed）。'
+            '「設定 → プライバシーとセキュリティ → 音声認識」で Safari がオンか、'
+            '「設定 → 一般 → キーボード → 音声入力」がオンかを確認してください。';
+      case 'not-allowed':
+        return 'マイクの使用が許可されていません。'
+            '「設定 → アプリ → Safari → マイク」を確認してください。';
+      case 'audio-capture':
+        return 'マイクを使えませんでした。ほかのアプリやタブがマイクを使っていないか確認してください。';
+      case 'network':
+        return 'ネットワークに接続できず、音声認識できませんでした。電波の良い場所でもう一度試してください。';
+      case 'no-speech':
+      case 'error_speech_timeout':
+      case 'error_no_match':
+        return '声を聞き取れませんでした。もう一度マイクボタンを押して話してください。';
+      case 'language-not-supported':
+        return 'この端末では日本語の音声認識が使えませんでした。';
+      case 'aborted':
+        return null;
+      default:
+        return '音声入力でエラーが起きました（$code）。';
+    }
+  }
+
+  void _showSpeechMessage(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 8),
+      ));
+  }
+
+  // 認識セッションを終了し、認識した文字をチャットに追加する（何度呼んでもよい）
+  void _finishListening(String reason) {
+    _speechRetryPending = false;
+    if (!_isListening) return;
+    _addSpeechLog('終了処理 ($reason)');
+    final text = _recognizedText.trim();
+    setState(() {
+      _isListening = false;
+      if (text.isNotEmpty) {
+        _messages.add(ChatMessage(text: text, isPartner: true));
+        // 入力欄にも残っていると、送信ボタンで二重に送られるため消す
+        _textController.clear();
+      }
+      _recognizedText = '';
+    });
   }
 
   // SharedPreferencesからカスタム語句を読み込む
