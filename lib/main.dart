@@ -5,6 +5,7 @@ import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'dart:async';
 import 'phrase_registration_screen.dart';
+import 'web_speech/azure_speech.dart';
 import 'web_speech/web_speech.dart';
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,6 +13,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 // ビルド時に CI から渡される版（git のコミット）。手元のビルドでは 'dev'
 const String _appVersion =
     String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
+
+// Azure Speech の一時トークンを発行する仲介サーバー（speech-token-worker）の URL。
+// CI から --dart-define=SPEECH_TOKEN_URL=... で渡す。空なら Azure は使わない
+const String _speechTokenUrl = String.fromEnvironment('SPEECH_TOKEN_URL');
 
 void main() {
   runApp(const MyApp());
@@ -200,6 +205,26 @@ class _PointingConversationScreenState
   };
   static const String _micModeKey = 'speech_mic_mode';
   String _micMode = 'hold';
+
+  // Web の音声エンジン（azure: Azure Speech / browser: ブラウザ内蔵の音声認識）
+  static const Map<String, String> _speechEngines = {
+    'azure': 'Azure（おすすめ）',
+    'browser': 'ブラウザ内蔵',
+  };
+  static const String _speechEngineKey = 'speech_engine';
+  String _speechEngine = _speechTokenUrl.isNotEmpty ? 'azure' : 'browser';
+  final AzureSpeechRecognizer _azureSpeech = AzureSpeechRecognizer();
+  Timer? _azureTokenTimer;
+  // 確定した文（Azure は文ごとに確定結果が届く）
+  String _azureCommitted = '';
+  bool _azureStopping = false;
+
+  // Azure に「認識されやすくしたい言葉」として渡す語句
+  static const List<String> _medicalPhrases = [
+    'ロキソニン', 'カロナール', 'お薬手帳', '処方箋', 'アレルギー',
+    '動悸', '息切れ', 'めまい', '吐き気', '頭痛', '腹痛', '発熱',
+    'ズキズキ', 'チクチク', 'ヒリヒリ', '既往歴', '服用',
+  ];
   bool _isOpponentMode = false;
   String _recognizedText = '';
 
@@ -216,6 +241,34 @@ class _PointingConversationScreenState
     super.initState();
     _loadCustomPhrasesForChat();
     _loadMicMode();
+    if (kIsWeb && _speechTokenUrl.isNotEmpty) {
+      AzureSpeechRecognizer.configure(_speechTokenUrl);
+      // iPhone では、ボタンを押した処理の中でマイクを開始する必要があるため、
+      // トークンは先に取っておき、期限前に取り直す
+      _prefetchAzureToken();
+      _azureTokenTimer = Timer.periodic(
+          const Duration(minutes: 8), (_) => _prefetchAzureToken());
+    }
+  }
+
+  Future<void> _prefetchAzureToken() async {
+    if (!kIsWeb || _speechEngine != 'azure') return;
+    try {
+      await AzureSpeechRecognizer.prefetchToken();
+      _addSpeechLog('Azure トークン取得 OK');
+    } catch (e) {
+      _addSpeechLog('Azure トークン取得 失敗: $e');
+    }
+  }
+
+  Future<void> _setSpeechEngine(String engine) async {
+    setState(() => _speechEngine = engine);
+    _addSpeechLog('音声エンジンを「${_speechEngines[engine]}」に変更');
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_speechEngineKey, engine);
+    } catch (_) {}
+    if (engine == 'azure') _prefetchAzureToken();
   }
 
   Future<void> _loadMicMode() async {
@@ -224,6 +277,13 @@ class _PointingConversationScreenState
       final saved = prefs.getString(_micModeKey);
       if (saved != null && _micModes.containsKey(saved) && mounted) {
         setState(() => _micMode = saved);
+      }
+      final engine = prefs.getString(_speechEngineKey);
+      if (engine != null &&
+          _speechEngines.containsKey(engine) &&
+          (engine != 'azure' || _speechTokenUrl.isNotEmpty) &&
+          mounted) {
+        setState(() => _speechEngine = engine);
       }
     } catch (_) {}
   }
@@ -240,7 +300,9 @@ class _PointingConversationScreenState
   @override
   void dispose() {
     _webAudioWatchdog?.cancel();
+    _azureTokenTimer?.cancel();
     if (kIsWeb) {
+      _azureSpeech.abort();
       _webSpeech.abort();
       _webSpeech.closeMic();
     } else {
@@ -292,7 +354,10 @@ class _PointingConversationScreenState
     final header = [
       '指さし会話 音声ログ',
       'version: $_appVersion',
-      if (kIsWeb) 'mic mode: $_micMode (${_micModes[_micMode]})',
+      if (kIsWeb) 'engine: $_speechEngine (${_speechEngines[_speechEngine]})',
+      if (kIsWeb) 'azure token url: ${_speechTokenUrl.isEmpty ? '(未設定)' : _speechTokenUrl}',
+      if (kIsWeb && _speechEngine == 'browser')
+        'mic mode: $_micMode (${_micModes[_micMode]})',
       'platform: ${kIsWeb ? 'web' : 'native'} / ${defaultTargetPlatform.name}',
       'exported: ${DateTime.now().toIso8601String()}',
       '',
@@ -320,7 +385,32 @@ class _PointingConversationScreenState
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              if (kIsWeb)
+              if (kIsWeb && _speechTokenUrl.isNotEmpty)
+                Row(
+                  children: [
+                    const Text('音声エンジン: ', style: TextStyle(fontSize: 13)),
+                    Expanded(
+                      child: DropdownButton<String>(
+                        isExpanded: true,
+                        value: _speechEngine,
+                        items: _speechEngines.entries
+                            .map((e) => DropdownMenuItem(
+                                  value: e.key,
+                                  child: Text(e.value, style: const TextStyle(fontSize: 13)),
+                                ))
+                            .toList(),
+                        onChanged: _isListening
+                            ? null
+                            : (engine) async {
+                                if (engine == null) return;
+                                await _setSpeechEngine(engine);
+                                setDialogState(() {});
+                              },
+                      ),
+                    ),
+                  ],
+                ),
+              if (kIsWeb && _speechEngine == 'browser')
                 Row(
                   children: [
                     const Text('マイク前処理（実験）: ', style: TextStyle(fontSize: 13)),
@@ -383,7 +473,10 @@ class _PointingConversationScreenState
   Future<void> _listenSpeech() async {
     if (_isListening) {
       _addSpeechLog('停止ボタン押下 (recognizedText="$_recognizedText")');
-      if (kIsWeb) {
+      if (kIsWeb && _speechEngine == 'azure') {
+        await _stopAzureListening();
+        return;
+      } else if (kIsWeb) {
         _webSpeech.stop();
         _addSpeechLog('stop() 呼び出し');
       } else {
@@ -400,6 +493,10 @@ class _PointingConversationScreenState
 
     _addSpeechLog('---- マイクボタン押下：開始 (version $_appVersion) ----');
 
+    if (kIsWeb && _speechEngine == 'azure') {
+      _startAzureListening();
+      return;
+    }
     if (kIsWeb) {
       await _startWebListening();
       return;
@@ -432,6 +529,124 @@ class _PointingConversationScreenState
     _localeAttempt = 0;
     _addSpeechLog('言語指定の候補: $_localeCandidates');
     await _startListeningAttempt();
+  }
+
+  // Web：Azure Speech でリアルタイム認識を始める。
+  // iPhone の Safari ではボタン操作の中でマイクを開始する必要があるため、
+  // この関数は await を挟まずに start() まで進める。
+  void _startAzureListening() {
+    if (!AzureSpeechRecognizer.isAvailable) {
+      _addSpeechLog('Azure Speech SDK が読み込まれていません');
+      _showSpeechMessage('音声認識の準備ができていません。'
+          'ページを再読み込みしてから、もう一度試してください。');
+      return;
+    }
+
+    final sessionId = ++_speechSessionId;
+    bool current() => sessionId == _speechSessionId && _isListening;
+    _azureCommitted = '';
+    _azureStopping = false;
+    _receivedSpeechResult = false;
+
+    void showText(String text) {
+      if (text.isEmpty) return;
+      _receivedSpeechResult = true;
+      setState(() {
+        _recognizedText = text;
+        _textController.value = TextEditingValue(
+          text: text,
+          selection: TextSelection.collapsed(offset: text.length),
+        );
+      });
+    }
+
+    _azureSpeech
+      ..onEvent = (event, detail) {
+        _addSpeechLog('azure #$sessionId: $event${detail.isEmpty ? '' : ' ($detail)'}');
+      }
+      ..onPartial = (text) {
+        if (!current()) return;
+        _addSpeechLog('途中 #$sessionId: "$text"');
+        showText(_azureCommitted + text);
+      }
+      ..onFinal = (text) {
+        if (!current()) return;
+        _addSpeechLog('確定 #$sessionId: "$text"');
+        _azureCommitted += text;
+        showText(_azureCommitted);
+      }
+      ..onError = (code, detail) {
+        _addSpeechLog('azure エラー #$sessionId: $code ($detail)');
+        if (!current()) return;
+        _azureSpeech.abort();
+        _finishListening('azure エラー: $code');
+        _showSpeechMessage(_azureErrorMessage(code, detail));
+      };
+
+    setState(() {
+      _isListening = true;
+      _recognizedText = '';
+    });
+
+    final phrases = <String>{
+      ..._medicalPhrases,
+      for (final list in _customPhrasesMap.values) ...list,
+    }.where((p) => p.trim().isNotEmpty).take(300).toList();
+
+    final tokenReady = AzureSpeechRecognizer.hasFreshToken;
+    final ok = _azureSpeech.start(lang: 'ja-JP', phrases: phrases);
+    _addSpeechLog('azure start() #$sessionId: $ok '
+        '(token=${tokenReady ? '取得済み' : '未取得→取得してから開始'}, 語句=${phrases.length})');
+    if (!ok) {
+      _finishListening('azure start() 失敗');
+    }
+  }
+
+  // Azure：停止ボタン。最後の確定結果を待ってから終了する（最大3秒）
+  Future<void> _stopAzureListening() async {
+    if (_azureStopping) return;
+    _azureStopping = true;
+    final sessionId = _speechSessionId;
+    final ended = Completer<void>();
+    _azureSpeech.stop(() {
+      if (!ended.isCompleted) ended.complete();
+    });
+    _addSpeechLog('azure stop() 呼び出し #$sessionId');
+    try {
+      await ended.future.timeout(const Duration(seconds: 3));
+      _addSpeechLog('azure 停止完了 #$sessionId');
+    } on TimeoutException {
+      _addSpeechLog('azure 停止待ちタイムアウト #$sessionId');
+      _azureSpeech.abort();
+    }
+    _azureStopping = false;
+    if (sessionId == _speechSessionId) {
+      _finishListening('停止ボタン');
+    }
+  }
+
+  String _azureErrorMessage(String code, String detail) {
+    final lower = detail.toLowerCase();
+    if (lower.contains('notallowed') ||
+        lower.contains('permission') ||
+        lower.contains('microphone')) {
+      return 'マイクを使えませんでした。'
+          '「設定 → アプリ → Safari → マイク」で許可されているか確認してください。';
+    }
+    switch (code) {
+      case 'TokenFailed':
+        return '音声認識サーバーに接続できませんでした。電波を確認して、もう一度試してください。';
+      case 'AuthenticationFailure':
+      case 'Forbidden':
+        return '音声認識サーバーの認証に失敗しました。ページを再読み込みしてください。';
+      case 'TooManyRequests':
+        return '音声認識の利用上限に達しました。しばらくしてから試してください。';
+      case 'ConnectionFailure':
+      case 'ServiceTimeout':
+        return '音声認識サーバーとの通信が切れました。電波を確認して、もう一度試してください。';
+      default:
+        return '音声入力でエラーが起きました（$code）。';
+    }
   }
 
   // Web：ブラウザの音声認識を直接使って1回分の認識を始める。
