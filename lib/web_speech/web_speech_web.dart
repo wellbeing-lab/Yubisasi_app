@@ -21,6 +21,54 @@ class WebSpeechRecognizer {
       globalContext.getProperty<JSFunction?>('SpeechRecognition'.toJS) ??
       globalContext.getProperty<JSFunction?>('webkitSpeechRecognition'.toJS);
 
+  // getUserMedia で開いたマイクのストリーム（実験用）
+  JSObject? _micStream;
+
+  /// getUserMedia でマイクを開き、トラックの状態を文字列で返す。
+  Future<String> openMic() async {
+    closeMic();
+    final navigator = globalContext.getProperty<JSObject>('navigator'.toJS);
+    final mediaDevices = navigator.getProperty<JSObject?>('mediaDevices'.toJS);
+    if (mediaDevices == null) {
+      throw StateError('navigator.mediaDevices がありません');
+    }
+    final constraints = JSObject()..['audio'] = true.toJS;
+    final stream = await mediaDevices
+        .callMethod<JSPromise<JSObject>>('getUserMedia'.toJS, constraints)
+        .toDart;
+    _micStream = stream;
+    return micInfo();
+  }
+
+  /// 開いているマイクのトラックの状態（label / readyState / muted / enabled）。
+  String micInfo() {
+    final stream = _micStream;
+    if (stream == null) return 'マイク未オープン';
+    final tracks =
+        stream.callMethod<JSArray<JSObject>>('getAudioTracks'.toJS).toDart;
+    return tracks.map((t) {
+      final label = t.getProperty<JSString?>('label'.toJS)?.toDart ?? '';
+      final state = t.getProperty<JSString?>('readyState'.toJS)?.toDart ?? '';
+      final muted = t.getProperty<JSBoolean?>('muted'.toJS)?.toDart;
+      final enabled = t.getProperty<JSBoolean?>('enabled'.toJS)?.toDart;
+      return '[$label state=$state muted=$muted enabled=$enabled]';
+    }).join(' ');
+  }
+
+  /// getUserMedia で開いたマイクを閉じる。
+  void closeMic() {
+    final stream = _micStream;
+    _micStream = null;
+    if (stream == null) return;
+    try {
+      final tracks =
+          stream.callMethod<JSArray<JSObject>>('getTracks'.toJS).toDart;
+      for (final t in tracks) {
+        t.callMethod<JSAny?>('stop'.toJS);
+      }
+    } catch (_) {}
+  }
+
   void Function(String event)? onEvent;
   void Function(String transcript, bool isFinal)? onResult;
   void Function(String error, String message)? onError;

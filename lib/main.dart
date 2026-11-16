@@ -189,6 +189,17 @@ class _PointingConversationScreenState
   Completer<void>? _webSpeechEnded;
   Timer? _webAudioWatchdog;
   bool _webAudioStarted = false;
+  // 実験：認識の前に getUserMedia でマイクを開くか
+  //   hold  … 開いたまま認識し、認識が終わったら閉じる
+  //   prime … 開いてすぐ閉じてから認識する
+  //   none  … 何もしない
+  static const Map<String, String> _micModes = {
+    'hold': '認識中ずっと開く',
+    'prime': '開いてすぐ閉じる',
+    'none': 'なし',
+  };
+  static const String _micModeKey = 'speech_mic_mode';
+  String _micMode = 'hold';
   bool _isOpponentMode = false;
   String _recognizedText = '';
 
@@ -204,6 +215,26 @@ class _PointingConversationScreenState
   void initState() {
     super.initState();
     _loadCustomPhrasesForChat();
+    _loadMicMode();
+  }
+
+  Future<void> _loadMicMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final saved = prefs.getString(_micModeKey);
+      if (saved != null && _micModes.containsKey(saved) && mounted) {
+        setState(() => _micMode = saved);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _setMicMode(String mode) async {
+    setState(() => _micMode = mode);
+    _addSpeechLog('マイク前処理を「${_micModes[mode]}」に変更');
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(_micModeKey, mode);
+    } catch (_) {}
   }
 
   @override
@@ -211,6 +242,7 @@ class _PointingConversationScreenState
     _webAudioWatchdog?.cancel();
     if (kIsWeb) {
       _webSpeech.abort();
+      _webSpeech.closeMic();
     } else {
       // 共有インスタンスなので、この画面のコールバックを外してから止める
       _speech.statusListener = null;
@@ -260,6 +292,7 @@ class _PointingConversationScreenState
     final header = [
       '指さし会話 音声ログ',
       'version: $_appVersion',
+      if (kIsWeb) 'mic mode: $_micMode (${_micModes[_micMode]})',
       'platform: ${kIsWeb ? 'web' : 'native'} / ${defaultTargetPlatform.name}',
       'exported: ${DateTime.now().toIso8601String()}',
       '',
@@ -278,20 +311,51 @@ class _PointingConversationScreenState
   void _showSpeechLogDialog() {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
         title: const Text('音声ログ'),
         content: SizedBox(
           width: double.maxFinite,
-          height: 400,
-          child: _speechLogs.isEmpty
-              ? const Center(child: Text('ログはまだありません'))
-              : SingleChildScrollView(
-                  reverse: true,
-                  child: SelectableText(
-                    _speechLogText(),
-                    style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-                  ),
+          height: 440,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (kIsWeb)
+                Row(
+                  children: [
+                    const Text('マイク前処理（実験）: ', style: TextStyle(fontSize: 13)),
+                    Expanded(
+                      child: DropdownButton<String>(
+                        isExpanded: true,
+                        value: _micMode,
+                        items: _micModes.entries
+                            .map((e) => DropdownMenuItem(
+                                  value: e.key,
+                                  child: Text(e.value, style: const TextStyle(fontSize: 13)),
+                                ))
+                            .toList(),
+                        onChanged: (mode) async {
+                          if (mode == null) return;
+                          await _setMicMode(mode);
+                          setDialogState(() {});
+                        },
+                      ),
+                    ),
+                  ],
                 ),
+              Expanded(
+                child: _speechLogs.isEmpty
+                    ? const Center(child: Text('ログはまだありません'))
+                    : SingleChildScrollView(
+                        reverse: true,
+                        child: SelectableText(
+                          _speechLogText(),
+                          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                        ),
+                      ),
+              ),
+            ],
+          ),
         ),
         actions: [
           TextButton(
@@ -310,6 +374,7 @@ class _PointingConversationScreenState
             child: const Text('閉じる'),
           ),
         ],
+      ),
       ),
     );
   }
@@ -417,6 +482,9 @@ class _PointingConversationScreenState
       }
       ..onError = (code, message) {
         _addSpeechLog('onError #$sessionId: $code ${message.isEmpty ? '' : '($message)'}');
+        if (_micMode == 'hold') {
+          _addSpeechLog('マイクの状態 #$sessionId: ${_webSpeech.micInfo()}');
+        }
         if (sessionId != _speechSessionId) return;
         _finishListening('onError: $code');
         final text = _speechErrorMessage(code);
@@ -424,6 +492,7 @@ class _PointingConversationScreenState
       }
       ..onEnd = () {
         _addSpeechLog('event #$sessionId: end');
+        _webSpeech.closeMic();
         final ended = _webSpeechEnded;
         _webSpeechEnded = null;
         if (ended != null && !ended.isCompleted) ended.complete();
@@ -437,6 +506,26 @@ class _PointingConversationScreenState
       _recognizedText = '';
     });
 
+    if (_micMode != 'none') {
+      _addSpeechLog('マイク前処理 #$sessionId: ${_micModes[_micMode]}');
+      try {
+        final info = await _webSpeech.openMic();
+        _addSpeechLog('getUserMedia OK #$sessionId: $info');
+      } catch (e) {
+        _addSpeechLog('getUserMedia 失敗 #$sessionId: $e');
+      }
+      if (_micMode == 'prime') {
+        _webSpeech.closeMic();
+        _addSpeechLog('マイクを閉じました #$sessionId');
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+      if (sessionId != _speechSessionId || !_isListening) {
+        // 待っている間に停止された
+        _webSpeech.closeMic();
+        return;
+      }
+    }
+
     final ok = _webSpeech.start(
       lang: 'ja-JP',
       continuous: false,
@@ -444,6 +533,7 @@ class _PointingConversationScreenState
     );
     _addSpeechLog('start() #$sessionId: $ok (lang=ja-JP, continuous=false)');
     if (!ok) {
+      _webSpeech.closeMic();
       _finishListening('start() 失敗');
       return;
     }
@@ -454,6 +544,9 @@ class _PointingConversationScreenState
       if (sessionId == _speechSessionId && _isListening && !_webAudioStarted) {
         _addSpeechLog('警告 #$sessionId: 4秒たっても audiostart が来ていません'
             '（マイクの音が認識に届いていない可能性）');
+      }
+      if (sessionId == _speechSessionId && _isListening && _micMode == 'hold') {
+        _addSpeechLog('マイクの状態 #$sessionId (4秒後): ${_webSpeech.micInfo()}');
       }
     });
   }
