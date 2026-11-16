@@ -32,7 +32,11 @@ jobs:
 
       - name: Build web
         # GitHub Pages はリポジトリ名のサブパスで公開されるため base-href を指定する
-        run: flutter build web --release --base-href "/${{ github.event.repository.name }}/"
+        # APP_VERSION はアプリ内の音声ログに表示し、どの版が動いているか確認するため
+        run: >-
+          flutter build web --release
+          --base-href "/${{ github.event.repository.name }}/"
+          --dart-define=APP_VERSION=${{ github.event.pull_request.head.sha || github.sha }}
 
       - uses: actions/upload-pages-artifact@v3
         if: github.event_name != 'pull_request'
