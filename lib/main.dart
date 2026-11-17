@@ -247,7 +247,6 @@ class _PointingConversationScreenState
           setState(() {
             _recognizedText = val.recognizedWords;
             // 認識されたらテキストコントローラーやチャットに即時反映
-            _textController.text = _recognizedText;
           });
         }
       },
